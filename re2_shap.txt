@@ -1,0 +1,989 @@
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score, median_absolute_error
+import random
+from math import radians, sin, cos, sqrt, atan2
+from tqdm import tqdm
+
+tqdm.pandas(desc="Processing")
+import warnings
+warnings.filterwarnings('ignore')
+
+# 设置字体
+import matplotlib.pyplot as plt
+plt.rcParams["font.family"] = ["Times New Roman", "serif"]
+plt.rcParams['axes.unicode_minus'] = False
+
+# =================== 辅助函数和种子设置 =====================
+def set_seed(seed=3407):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+set_seed(42)
+
+def haversine(lon1, lat1, lon2, lat2):
+    R = 6371000  # 地球半径(米)
+    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat/2)**2 + cos(lat1)*cos(lat2)*sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    return R * c
+
+def build_neighbors(site_info_df, thresh=14000):
+    print("[Log] Calculating neighbor relationships between sites...")
+    nodes = site_info_df['FID_'].values
+    lons  = site_info_df['longitude'].values
+    lats  = site_info_df['latitude'].values
+    neighbors = {}
+    for i, nid in tqdm(enumerate(nodes), total=len(nodes), desc="[Log] Building neighbors"):
+        nbs = []
+        for j, njid in enumerate(nodes):
+            if i == j: continue
+            dist = haversine(lons[i], lats[i], lons[j], lats[j])
+            if dist < thresh:
+                nbs.append(njid)
+        neighbors[nid] = nbs
+    print(f"[Log] Completed neighbor calculation for {len(nodes)} sites")
+    return neighbors
+
+def build_adj_matrix(node_order, neighbors):
+    N = len(node_order)
+    nd2idx = {n:i for i,n in enumerate(node_order)}
+    adj = np.eye(N)
+    for i, ni in enumerate(node_order):
+        nbs = neighbors[ni]
+        for nj in nbs:
+            if nj in nd2idx:
+                adj[i, nd2idx[nj]] = 1
+    deg = np.sum(adj, axis=1)
+    deg[deg == 0] = 1
+    deg_inv_sqrt = np.power(deg, -0.5)
+    D = np.diag(deg_inv_sqrt)
+    adj = D @ adj @ D
+    return torch.tensor(adj, dtype=torch.float32)
+
+# =================== 多尺度分解器 =====================
+class AdaptiveMultiScaleDecomposer:
+    def __init__(self, max_period=30, num_scales=3):
+        self.max_period = max_period
+        self.num_scales = num_scales
+        self.periods = {}
+        self.component_weights = {}
+
+    def fit(self, node_id, series):
+        series = series.dropna()
+        if len(series) < 2 * self.max_period:
+            self.periods[node_id] = [7, 14, 28][:self.num_scales]
+            self.component_weights[node_id] = np.ones(self.num_scales + 2) / (self.num_scales + 2)
+            return
+        best_periods = []
+        data = series.values
+        n = len(data)
+        autocorr = []
+        for p in range(1, self.max_period + 1):
+            if n < 2 * p:
+                autocorr.append(0)
+                continue
+            corr = np.corrcoef(data[:-p], data[p:])[0, 1]
+            autocorr.append(corr)
+        period_candidates = np.argsort(autocorr)[::-1] + 1
+        best_periods = period_candidates[:self.num_scales]
+        best_periods = list(dict.fromkeys(best_periods))[:self.num_scales] # 去重并取前num_scales个
+        while len(best_periods) < self.num_scales:
+            best_periods.append(7) # 补充默认周期
+        self.periods[node_id] = best_periods
+        self.component_weights[node_id] = np.ones(self.num_scales + 2) / (self.num_scales + 2)
+
+    def decompose(self, node_id, series):
+        if node_id not in self.periods:
+            self.fit(node_id, series)
+        series = series.interpolate(method='time') # 填充缺失值
+        periods = self.periods[node_id]
+        weights = self.component_weights[node_id]
+
+        trend = series.rolling(window=30, min_periods=7, center=True).mean()
+        trend = trend.fillna(method='ffill').fillna(method='bfill') # 填充边缘缺失
+
+        periodic_components = []
+        for p in periods:
+            # 简单周期分解：原始序列 - 周期性均值 + 周期均值的平滑，以提取周期性
+            period_avg = series.rolling(window=p, min_periods=1, center=True).mean()
+            periodic = series - period_avg + period_avg.rolling(window=7, min_periods=1).mean()
+            periodic_components.append(periodic.fillna(0)) # 填充0，假定周期性为0
+
+        residual = series - trend
+        for comp in periodic_components:
+            residual -= comp # 从残差中减去周期性分量
+        
+        components = [trend] + periodic_components + [residual]
+        fused = sum(w * comp for w, comp in zip(weights, components)) # 加权融合
+        
+        result = pd.DataFrame({'trend': trend, 'fused': fused, 'residual': residual})
+        for i, p in enumerate(periods):
+            result[f'periodic_{p}d'] = periodic_components[i]
+        return result
+
+# =================== 数据集类 =====================
+class OzoneSeqDataset(Dataset):
+    def __init__(self, data_path, seq_len=7, train=True, train_ratio=0.8, feature_cols=None, 
+                 max_period=30, num_scales=3):
+        self.seq_len = seq_len
+        self.max_period = max_period
+        self.num_scales = num_scales
+        self.decomposer = AdaptiveMultiScaleDecomposer(max_period, num_scales)
+        
+        print(f"[Log] Loading {'training' if train else 'validation'} data from {data_path}...")
+        data = pd.read_excel(data_path)
+        print(f"[Log] Data loaded: {data.shape[0]} rows, {data.shape[1]} columns")
+        
+        self.node_col = 'FID_'
+        self.time_col = 'date'
+        self.target_col = 'o3'
+        data[self.time_col] = pd.to_datetime(data[self.time_col])
+        print(f"[Log] Converted '{self.time_col}' to datetime format")
+        
+        print("[Log] Extracting site information (ID, longitude, latitude)...")
+        site_info = data[[self.node_col, 'longitude', 'latitude']].drop_duplicates()
+        print(f"[Log] Found {len(site_info)} unique sites")
+        self.neighbors = build_neighbors(site_info)
+        data['neighbors'] = data[self.node_col].map(self.neighbors)
+        
+        print("[Log] Building ozone lookup table (date + site -> ozone value)...")
+        o3_lookup = data.set_index([self.time_col, self.node_col])['o3'].to_dict()
+        
+        print("[Log] Calculating neighbor ozone statistics (mean/max/min/median)...")
+        def neighbor_o3_stats(row):
+            nbs = row['neighbors']
+            # 从o3_lookup获取邻居当天的o3值
+            vals = [o3_lookup.get((row['date'], nb)) for nb in nbs if (row['date'], nb) in o3_lookup]
+            cleaned = [v for v in vals if v is not None and not pd.isnull(v)]
+            if cleaned:
+                arr = np.array(cleaned)
+                return pd.Series({
+                    'o3_neighbor_mean': arr.mean(),
+                    'o3_neighbor_max': arr.max(),
+                    'o3_neighbor_min': arr.min(),
+                    'o3_neighbor_median': np.median(arr),
+                })
+            else:
+                return pd.Series({ # 如果没有邻居数据，返回NaN
+                    'o3_neighbor_mean': np.nan,
+                    'o3_neighbor_max': np.nan,
+                    'o3_neighbor_min': np.nan,
+                    'o3_neighbor_median': np.nan,
+                })
+        # 应用到每一行，计算邻居统计
+        neighbor_df = data.progress_apply(neighbor_o3_stats, axis=1)
+        data = pd.concat([data, neighbor_df], axis=1)
+        print("[Log] Filling missing neighbor statistics with global values...")
+        # 填充缺失的邻居统计值（例如，用全局的o3平均值/最大值等）
+        data['o3_neighbor_mean']   = data['o3_neighbor_mean'  ].fillna(data['o3'].mean())
+        data['o3_neighbor_max']    = data['o3_neighbor_max'   ].fillna(data['o3'].max())
+        data['o3_neighbor_min']    = data['o3_neighbor_min'   ].fillna(data['o3'].min())
+        data['o3_neighbor_median'] = data['o3_neighbor_median'].fillna(data['o3'].median())
+        
+        print("[Log] Starting multi-scale decomposition for each site's ozone sequence...")
+        ms_features = pd.DataFrame()
+        nodes = data[self.node_col].unique()
+        for node in tqdm(nodes, desc="[Log] Decomposing sites"):
+            node_data = data[data[self.node_col] == node].sort_values(self.time_col)
+            node_series = node_data.set_index(self.time_col)[self.target_col]
+            self.decomposer.fit(node, node_series)
+            components = self.decomposer.decompose(node, node_series)
+            components[self.node_col] = node
+            components.reset_index(inplace=True)
+            ms_features = pd.concat([ms_features, components], ignore_index=True)
+        data = pd.merge(data, ms_features, on=[self.time_col, self.node_col], how='left')
+        self.ms_feature_cols = [col for col in ms_features.columns if col not in [self.time_col, self.node_col]]
+        print(f"[Log] Generated {len(self.ms_feature_cols)} multi-scale decomposition features")
+        
+        print("[Log] Filling missing values in decomposition features...")
+        for col in self.ms_feature_cols:
+            data[col] = data[col].fillna(data[col].mean())
+        
+        print("[Log] Calculating historical ozone features (rolling mean)...")
+        data = data.sort_values([self.node_col, self.time_col])
+        data['o3_yesterday'] = data.groupby(self.node_col)[self.target_col]\
+                                    .transform(lambda s: s.shift(1).rolling(3).mean())
+        data['o3_yesterday'] = data['o3_yesterday'].fillna(data['o3'].mean())
+        
+        # 初始特征列表，可以根据你的实际数据调整
+        base_feats = ['MAX', 'TEMP', 'MIN', 'DEWP', 'SLP', 'NO2','dem','CO','c1','c2','c4','c5','c7','c8','human','road']
+        neighbor_cols = ['o3_neighbor_mean', 'o3_neighbor_max', 'o3_neighbor_min', 'o3_neighbor_median']
+        history_cols = ['o3_yesterday']
+        self.feature_cols = base_feats + history_cols + neighbor_cols + self.ms_feature_cols
+        if feature_cols is not None: # 如果外部指定了特征列，则合并
+            feats = list(feature_cols)
+            for c in history_cols + neighbor_cols + self.ms_feature_cols:
+                if c not in feats:
+                    feats.append(c)
+            self.feature_cols = feats
+        print(f"[Log] Total features selected: {len(self.feature_cols)}")
+        
+        self.num_nodes = data[self.node_col].nunique()
+        data = data.sort_values([self.time_col, self.node_col])
+        self.node_order = sorted(data[self.node_col].unique()) # 保证节点顺序一致
+        all_dates = sorted(data[self.time_col].unique())
+        print(f"[Log] Total unique sites: {self.num_nodes}, total unique dates: {len(all_dates)}")
+        
+        # 训练/验证集时间切分
+        split_idx = int(len(all_dates)*train_ratio)
+        if train:
+            used_dates = all_dates[:split_idx]
+        else:
+            used_dates = all_dates[split_idx:]
+        sub = data[data[self.time_col].isin(used_dates)].reset_index(drop=True)
+        print(f"[Log] {'Training' if train else 'Validation'} set date range: {used_dates[0]} to {used_dates[-1]}")
+        print(f"[Log] {'Training' if train else 'Validation'} set size: {len(sub)} rows")
+        
+        print("[Log] Normalizing features and targets for each site...")
+        self.feature_scalers = {}
+        self.target_scalers = {}
+        # 为每个站点独立训练 StandardScaler
+        for node in tqdm(self.node_order, desc="[Log] Normalizing sites"):
+            this_feat = sub[sub[self.node_col]==node][self.feature_cols].values
+            this_y = sub[sub[self.node_col]==node][[self.target_col]].values
+            self.feature_scalers[node] = StandardScaler().fit(this_feat)
+            self.target_scalers[node] = StandardScaler().fit(this_y)
+        
+        print("[Log] Generating samples via sliding window...")
+        self.samples = []
+        # 将数据透视成 (日期, 站点) -> 特征/目标值，方便按时间窗提取
+        pivot = sub.pivot(index=self.time_col, columns=self.node_col)
+        all_dates = sorted(pivot.index)
+        total_windows = len(all_dates) - seq_len
+        
+        for i in tqdm(range(total_windows), desc="[Log] Generating windows"):
+            seq_dates = all_dates[i:i+seq_len] # 输入序列的日期
+            target_date = all_dates[i+seq_len] # 目标预测的日期
+
+            X = []
+            valid_window = True
+            for nd in self.node_order:
+                # 提取当前站点在序列日期内的特征数据
+                ndata = sub[(sub[self.node_col]==nd) & (sub[self.time_col].isin(seq_dates))]
+                if len(ndata)!=seq_len: # 如果某个站点在当前时间窗内数据不完整，跳过此窗
+                    valid_window = False
+                    break
+                # 对当前站点特征进行标准化
+                nf = self.feature_scalers[nd].transform(ndata[self.feature_cols].values)
+                X.append(nf) # nf 的形状是 (seq_len, num_features)
+            
+            if not valid_window or len(X)!=self.num_nodes:
+                continue # 如果数据不完整，跳过此时间窗
+
+            # 准备目标值 Y
+            ydata = sub[(sub[self.time_col]==target_date)].set_index(self.node_col)
+            # 检查目标日期的数据是否完整覆盖所有站点
+            if set(ydata.index)!=set(self.node_order):
+                continue
+
+            y_arr = np.zeros(self.num_nodes)
+            for j, nd in enumerate(self.node_order):
+                yval = ydata.loc[nd,self.target_col]
+                # 对目标值进行标准化
+                y_arr[j] = self.target_scalers[nd].transform([[yval]])[0,0]
+            
+            self.samples.append({'x': np.stack(X,axis=0), 'y': y_arr}) # x: (num_nodes, seq_len, num_features)
+        print(f"[Log] Completed sample generation: {len(self.samples)} valid samples")
+
+    def __len__(self): return len(self.samples)
+    def __getitem__(self, idx):
+        s = self.samples[idx]
+        return torch.FloatTensor(s['x']), torch.FloatTensor(s['y'])
+    
+    def get_num_nodes(self): return len(self.node_order)
+    def get_num_features(self): return len(self.feature_cols)
+    def get_scalers(self): return (self.feature_scalers, self.target_scalers)
+    def get_node_order(self): return self.node_order
+    def get_neighbors(self): return self.neighbors
+    def get_decomposer(self): return self.decomposer
+    def get_feature_cols(self): return self.feature_cols # 新增方法，用于获取特征列名
+
+# =================== DDVI核心层 (贝叶斯不确定性) =====================
+class DDVILinear(nn.Module):
+    def __init__(self, in_features, out_features, prior_std=0.1):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        self.prior_std = prior_std
+        
+        # 均值参数
+        self.mu_weight = nn.Parameter(torch.Tensor(out_features, in_features).normal_(0, 0.02))
+        self.rho_weight = nn.Parameter(torch.Tensor(out_features, in_features).fill_(-7)) # sigma = log(1+exp(rho))
+        # 偏置参数
+        self.mu_bias = nn.Parameter(torch.Tensor(out_features).normal_(0, 0.02))
+        self.rho_bias = nn.Parameter(torch.Tensor(out_features).fill_(-7))
+
+    def forward(self, x):
+        # 计算权重和偏置的标准差
+        sigma_weight = torch.log1p(torch.exp(self.rho_weight))
+        sigma_bias = torch.log1p(torch.exp(self.rho_bias))
+        
+        # 采样 epsilon
+        eps_weight = torch.randn_like(sigma_weight)
+        eps_bias = torch.randn_like(sigma_bias)
+        
+        # 重参数化技巧：从均值和标准差构建实际的权重和偏置
+        weight = self.mu_weight + eps_weight * sigma_weight
+        bias = self.mu_bias + eps_bias * sigma_bias
+        
+        # 前向传播的均值输出
+        out = torch.matmul(x, weight.t()) + bias
+        
+        # 计算前向传播的方差（对应不确定性）
+        # var(WX + B) = var(WX) + var(B) = X^2 * var(W) + var(B)
+        x_sq = x **2
+        weight_var = torch.matmul(x_sq, (sigma_weight**2).t())
+        bias_var = sigma_bias **2
+        total_var = weight_var + bias_var
+        
+        return out, total_var
+
+class DDVIConv1d(nn.Module):
+    def __init__(self, in_channels, out_channels, kernel_size, padding=0, prior_std=0.1):
+        super().__init__()
+        self.prior_std = prior_std
+        
+        self.mu_weight = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size).normal_(0, 0.02))
+        self.rho_weight = nn.Parameter(torch.Tensor(out_channels, in_channels, kernel_size).fill_(-7))
+        self.mu_bias = nn.Parameter(torch.Tensor(out_channels).normal_(0, 0.02))
+        self.rho_bias = nn.Parameter(torch.Tensor(out_channels).fill_(-7))
+        self.padding = padding
+
+    def forward(self, x):
+        sigma_weight = torch.log1p(torch.exp(self.rho_weight))
+        sigma_bias = torch.log1p(torch.exp(self.rho_bias))
+        
+        eps_weight = torch.randn_like(sigma_weight)
+        eps_bias = torch.randn_like(sigma_bias)
+        
+        weight = self.mu_weight + eps_weight * sigma_weight
+        bias = self.mu_bias + eps_bias * sigma_bias
+        
+        out = nn.functional.conv1d(x, weight, bias, padding=self.padding)
+        
+        x_sq = x **2
+        weight_var = nn.functional.conv1d(x_sq, sigma_weight**2, None, padding=self.padding)
+        bias_var = (sigma_bias **2).view(1, -1, 1) # 扩展到匹配卷积输出的形状
+        total_var = weight_var + bias_var
+        
+        return out, total_var
+
+# =================== 多尺度结构 (DDVI结合) =====================
+class MultiScaleGCNLayer(nn.Module):
+    def __init__(self, in_feats, out_feats, num_scales=3):
+        super().__init__()
+        self.num_scales = num_scales
+        # 每个尺度一个DDVI线性层
+        self.scale_convs = nn.ModuleList([
+            DDVILinear(in_feats, out_feats) for _ in range(num_scales)
+        ])
+        # 门控机制，DDVI线性层用于加权不同尺度的输出
+        self.gate = DDVILinear(out_feats * num_scales, out_feats)
+        # 用于生成尺度权重的线性层
+        self.scale_proj = nn.Linear(out_feats, num_scales)
+
+    def forward(self, x, adj):
+        # 计算不同尺度的邻接矩阵（例如A^1, A^2, A^4）
+        adj_scales = [torch.matrix_power(adj, 2**i) for i in range(self.num_scales)]
+        
+        scale_outs = []
+        total_var = 0.0
+        
+        for i in range(self.num_scales):
+            scaled_adj = adj_scales[i]
+            # GCN传播： adj * 节点特征 (B, N, S, F)
+            out = torch.einsum('ij,bjsf->bisf', scaled_adj, x) # (B, N, S, F)
+            # DDVI线性变换
+            out, var = self.scale_convs[i](out)
+            scale_outs.append(out)
+            total_var = total_var + var # 累加不确定性
+        
+        B, N, S, F = scale_outs[0].shape
+        
+        # 拼接所有尺度的输出作为门控的输入
+        gate_input = torch.cat(scale_outs, dim=-1) # (B, N, S, F * num_scales)
+        gate_out, gate_var = self.gate(gate_input)
+        total_var = total_var + gate_var # 累加门控不确定性
+
+        # 通过一个线性层和softmax计算融合权重
+        gate_weights = self.scale_proj(gate_out) # (B, N, S, num_scales)
+        gate_weights = torch.softmax(gate_weights, dim=-1)
+        
+        # 加权融合不同尺度的输出
+        fused = sum(so * gate_weights[..., i:i+1] for i, so in enumerate(scale_outs)) # (B, N, S, F)
+        
+        return torch.relu(fused), total_var # 返回ReLU激活后的融合输出和总不确定性
+
+class MultiScaleGCN_LSTM_Attn_Net(nn.Module):
+    def __init__(self, num_nodes, seq_len, num_feat, cnn_channels=32, gcn_hidden=32,
+                 gcn_layers=1, lstm_hidden=128, num_layers=2, num_scales=3):
+        super().__init__()
+        self.gcn_layers = nn.ModuleList([
+            MultiScaleGCNLayer(
+                num_feat if i == 0 else gcn_hidden,
+                gcn_hidden,
+                num_scales
+            ) for i in range(gcn_layers)
+        ])
+        self.num_scales = num_scales
+        
+        # 根据尺度数量分配CNN通道数
+        self.out_channels_per_block = cnn_channels // num_scales
+        remaining_channels = cnn_channels % num_scales
+        self.channel_sizes = [self.out_channels_per_block + 1 if i < remaining_channels 
+                             else self.out_channels_per_block for i in range(num_scales)]
+        
+        self.cnn_blocks = nn.ModuleList()
+        for channels in self.channel_sizes:
+            self.cnn_blocks.append(nn.Sequential(
+                DDVIConv1d(gcn_hidden, channels, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.BatchNorm1d(channels)
+            ))
+        total_cnn_channels = sum(self.channel_sizes)
+        self.cnn_fusion = DDVIConv1d(total_cnn_channels, cnn_channels, kernel_size=1)
+        
+        self.bilstm = nn.LSTM(
+            input_size=cnn_channels,
+            hidden_size=lstm_hidden,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True
+        )
+        # 注意力机制的DDVI线性层
+        self.attn_linear = DDVILinear(lstm_hidden * 2, num_scales) 
+        self.attn_fusion = DDVILinear(lstm_hidden * 2 * num_scales, lstm_hidden * 2)
+        
+        self.fc = DDVILinear(lstm_hidden * 2, num_nodes)
+
+    def forward(self, x, adj):
+        total_var = 0.0 # 用于累积总不确定性
+        
+        h = x # (B, N, S, F_in)
+        for gcn in self.gcn_layers:
+            h, var = gcn(h, adj) # h: (B, N, S, gcn_hidden)
+            total_var = total_var + var
+        
+        B, N, S, F = h.shape
+        
+        cnn_outs = []
+        cnn_vars = []
+        for i in range(self.num_scales):
+            # 从GCN输出中提取特定尺度的时间切片 (例如，每num_scales个时间步取一个)
+            time_slice = h[:, :, i::self.num_scales, :] 
+            if time_slice.shape[2] < S: # 如果切片长度不足，进行填充
+                pad_len = S - time_slice.shape[2]
+                time_slice = torch.cat([time_slice, torch.zeros(B, N, pad_len, F).to(x.device)], dim=2)
+            
+            # 重新排列输入给CNN: (B*S_sliced, F_gcn, N)
+            cnn_in = time_slice.permute(0, 2, 1, 3).contiguous().view(B*S, N, F).permute(0, 2, 1)
+            
+            cnn_out, cnn_var = self.cnn_blocks[i][0](cnn_in) # DDVIConv1d
+            cnn_vars.append(cnn_var) # 收集CNN的方差
+            cnn_out = self.cnn_blocks[i][1:](cnn_out) # ReLU, BatchNorm
+            
+            # 对CNN输出进行池化，通常是时间维度或节点维度
+            cnn_out = torch.max(cnn_out, dim=-1)[0] # (B*S, channels_i)
+            cnn_outs.append(cnn_out.view(B, S, -1)) # 恢复B和S维度 (B, S, channels_i)
+        
+        cnn_combined = torch.cat(cnn_outs, dim=-1).permute(0, 2, 1) # (B, total_cnn_channels, S)
+        
+        # 处理CNN方差的累加
+        for var in cnn_vars:
+            pooled_var = torch.max(var, dim=-1)[0] # (B*S, channels_i)
+            pooled_var = pooled_var.view(B, S, -1) # (B, S, channels_i)
+            # 这里的维度变换是为了和total_var的维度 (B, N, S, F) 匹配
+            reshaped_var = pooled_var.permute(0, 2, 1) # (B, channels_i, S)
+            mean_var = reshaped_var.mean(dim=1, keepdim=True).unsqueeze(-1) # (B, 1, S, 1)
+            expanded_var = mean_var.expand(-1, N, -1, -1) # (B, N, S, 1)
+            total_var = total_var + expanded_var # 累加
+            
+        cnn_combined, fuse_var = self.cnn_fusion(cnn_combined) # DDVIConv1d
+        
+        # 处理CNN融合层方差的累加
+        fuse_var_permuted = fuse_var.permute(0, 2, 1) # (B, S, fuse_channels)
+        mean_fuse = fuse_var_permuted.mean(dim=2, keepdim=True).unsqueeze(1) # (B, 1, S, 1)
+        expanded_fuse = mean_fuse.expand(-1, N, -1, -1) # (B, N, S, 1)
+        total_var = total_var + expanded_fuse # 累加
+        
+        cnn_combined = cnn_combined.permute(0, 2, 1) # (B, S, cnn_channels)
+        
+        lstm_out, _ = self.bilstm(cnn_combined) # (B, S, lstm_hidden*2)
+        
+        # DDVI注意力机制
+        attn_w, attn_var = self.attn_linear(lstm_out) # (B, S, num_scales)
+        
+        # 处理注意力层方差的累加
+        mean_attn = attn_var.mean(dim=2, keepdim=True).unsqueeze(1) # (B, 1, S, 1)
+        expanded_attn = mean_attn.expand(-1, N, -1, -1) # (B, N, S, 1)
+        total_var = total_var + expanded_attn # 累加
+        
+        attn_weights = torch.softmax(attn_w, dim=1) # (B, S, num_scales)
+        
+        scale_contexts = []
+        for i in range(self.num_scales):
+            scale_w = attn_weights[..., i:i+1] # (B, S, 1)
+            scale_context = torch.sum(scale_w * lstm_out, dim=1) # (B, lstm_hidden*2)
+            scale_contexts.append(scale_context)
+            
+        context = torch.cat(scale_contexts, dim=-1) # (B, lstm_hidden*2 * num_scales)
+        context, fusion_var = self.attn_fusion(context) # DDVILinear
+        
+        # 处理注意力融合层方差的累加
+        mean_fusion = fusion_var.mean(dim=1, keepdim=True).unsqueeze(1).unsqueeze(1) # (B, 1, 1, 1)
+        expanded_fusion = mean_fusion.expand(-1, N, S, -1) # (B, N, S, 1)
+        total_var = total_var + expanded_fusion # 累加
+        
+        pred, fc_var = self.fc(context) # DDVILinear, pred: (B, num_nodes)
+        
+        # 最终不确定性汇总，简化为 (B, N)
+        total_var = total_var.mean(dim=2).mean(dim=2) # (B, N)
+        total_var = total_var + fc_var # 加上最终全连接层的不确定性
+        
+        pred_std = torch.sqrt(total_var + 1e-6) # 转换为标准差，避免0方差
+        
+        return pred, pred_std
+
+    def predict_with_uncertainty(self, x, adj, num_samples=10):
+        self.eval()
+        samples = []
+        std_samples = []
+        with torch.no_grad():
+            for _ in range(num_samples):
+                pred, std = self.forward(x, adj)
+                samples.append(pred)
+                std_samples.append(std)
+        mean_pred = torch.mean(torch.stack(samples), dim=0)
+        mean_std = torch.mean(torch.stack(std_samples), dim=0)
+        return mean_pred, mean_std
+
+# =================== 评估指标和训练循环 ===================
+
+def mape(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = (np.abs(y_true) > 1e-8) # 避免除以0
+    return (np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])).mean() * 100 if np.any(mask) else np.nan
+
+def smape(y_true, y_pred):
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    denominator = (np.abs(y_true) + np.abs(y_pred))
+    mask = denominator > 1e-8 # 避免除以0
+    return (2 * np.abs(y_pred[mask] - y_true[mask]) / denominator[mask]).mean() * 100 if np.any(mask) else np.nan
+
+def run_epoch(model, loader, device, adj, optimizer=None, feature_scalers=None, target_scalers=None, 
+              node_order=None, mc_samples=10):
+    total_loss = 0.0
+    steps = 0
+    preds = []
+    trues = []
+    pred_stds = []
+
+    def uncertainty_nll_loss(pred, y, std):
+        std = std.clamp(min=1e-4) # 避免标准差过小导致数值不稳定
+        nll = 0.5 * (((pred - y) ** 2) / (std ** 2) + torch.log(std ** 2))
+        return nll.mean()
+
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        
+        if optimizer is not None: # 训练模式
+            model.train()
+            optimizer.zero_grad()
+            out, std = model(x, adj) # DDVI模型在训练时返回均值和标准差
+            loss = uncertainty_nll_loss(out, y, std) # 使用NLL损失
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0) # 梯度裁剪
+            optimizer.step()
+            preds.append(out.detach().cpu().numpy())
+            total_loss += loss.item()
+        else: # 评估模式
+            model.eval()
+            # 在评估时进行多次MC采样，得到更稳定的均值和标准差估计
+            mean_out, mean_std = model.predict_with_uncertainty(x, adj, num_samples=mc_samples)
+            preds.append(mean_out.detach().cpu().numpy())
+            pred_stds.append(mean_std.detach().cpu().numpy())
+        
+        steps += 1
+        trues.append(y.detach().cpu().numpy())
+    
+    y_pred = np.concatenate(preds, axis=0)
+    y_true = np.concatenate(trues, axis=0)
+    
+    # 将预测和真实值逆标准化
+    if target_scalers is not None:
+        y_pred_inv = np.zeros_like(y_pred)
+        y_true_inv = np.zeros_like(y_true)
+        for i, nd in enumerate(node_order):
+            sc = target_scalers[nd]
+            y_pred_inv[:,i] = sc.inverse_transform(y_pred[:,i].reshape(-1,1)).flatten()
+            y_true_inv[:,i] = sc.inverse_transform(y_true[:,i].reshape(-1,1)).flatten()
+        y_pred = y_pred_inv
+        y_true = y_true_inv
+        
+        # 逆标准化预测标准差
+        if pred_stds:
+            std_inv_list = []
+            for batch_std in pred_stds:
+                std_inv = np.zeros_like(batch_std)
+                for i, nd in enumerate(node_order):
+                    sc = target_scalers[nd]
+                    std_inv[:,i] = batch_std[:,i] * sc.scale_ # 标准差逆标准化只乘以scale
+                std_inv_list.append(std_inv)
+            pred_stds = std_inv_list
+            
+    y_std = np.concatenate(pred_stds, axis=0) if pred_stds else None
+    
+    return (total_loss/steps if optimizer is not None else 0.0), y_pred, y_true, y_std
+
+# ===================== SHAP分析模块 =========================== #
+import shap # 确保这里导入了shap
+
+def shap_analysis(val_set, model, adj, node_order, feature_cols, seq_len, num_feat, device):
+    import shap
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import pandas as pd
+
+    print("\n[Log] Running SHAP analysis (低样本+CPU版)...")
+    # 建议只用一小部分样本，防OOM
+    shap_n_samples = 20
+
+    # 强制用CPU
+    model_cpu = model.cpu()
+    adj_cpu = adj.cpu()
+
+    # 样本准备
+    shap_X = np.array([s['x'] for s in val_set.samples[:shap_n_samples]])
+    shap_X_flat = shap_X.reshape((shap_n_samples, -1))
+
+    # 特征名生成（按你的原逻辑）
+    all_feat_names = []
+    for n in node_order:
+        for t in range(seq_len):
+            for f in feature_cols:
+                all_feat_names.append(f"Site_{n}_t{t}_{f}")
+
+    # 包装模型预测函数（一定不要to(device)）
+    def model_predict_for_shap(input_numpy_2d):
+        num_samples_batch = input_numpy_2d.shape[0]
+        X_tensor = torch.FloatTensor(
+            input_numpy_2d.reshape(num_samples_batch, len(node_order), seq_len, num_feat)
+        )
+        model_cpu.eval()
+        with torch.no_grad():
+            pred, _ = model_cpu(X_tensor, adj_cpu)
+            return pred.cpu().numpy()[:, 0]  # 只解释第0号站点
+
+    # 使用极小的背景数据
+    background = shap_X_flat[:5]
+
+    # KernelExplainer初始化与SHAP计算
+    explainer = shap.KernelExplainer(model_predict_for_shap, background)
+    print("[Log] Calculating SHAP values ... may need minutes.")
+    shap_values = explainer.shap_values(shap_X_flat, nsamples=50) # 样本和采样都降低
+
+    shap_values = np.array(shap_values)
+    mean_abs_shap = np.abs(shap_values).mean(axis=0)
+    shap_df = pd.DataFrame({'feature': all_feat_names, 'mean_abs_shap': mean_abs_shap})
+
+    shap_df_sorted = shap_df.sort_values(by="mean_abs_shap", ascending=False).reset_index(drop=True)
+
+    print("[SHAP] Top 10 important features (包含站点和时间步):")
+    print(shap_df_sorted.head(10).to_string(index=False))
+
+    # 聚合到基础特征名（如 "o3_yesterday"）
+    shap_df['base_feat'] = shap_df['feature'].apply(lambda x: '_'.join(x.split('_')[3:]))
+    feat_agg = shap_df.groupby('base_feat')['mean_abs_shap'].mean().sort_values(ascending=False)
+    print("\n平均特征重要性前10（聚合不同站点与时间步）:\n")
+    print(feat_agg.head(10).to_string())
+
+    # 可视化 Top 10 重要特征 (包含站点和时间步)
+    plt.figure(figsize=(12, 7))
+    plt.barh(shap_df_sorted['feature'][:10][::-1], shap_df_sorted['mean_abs_shap'][:10][::-1], color='skyblue')
+    plt.xlabel("Mean(|SHAP value|) (Contribution)", fontsize=13)
+    plt.title("Top 10 Feature Contributions (SHAP) - Detailed", fontsize=15)
+    plt.grid(axis='x', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+    # 可视化 Top 10 基础特征 (聚合后)
+    plt.figure(figsize=(10, 6))
+    plt.bar(feat_agg.index[:10], feat_agg.values[:10], color='lightcoral')
+    plt.xlabel("Base Feature Name", fontsize=13)
+    plt.ylabel("Mean(|SHAP value|) (Contribution)", fontsize=13)
+    plt.title("Top 10 Base Feature Contributions (SHAP) - Aggregated", fontsize=15)
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+    plt.show()
+
+# ===================== MAIN 函数入口 =========================== #
+def main():
+    data_path = 'daily.xlsx'
+    seq_len = 7
+    num_scales = 3
+    max_period = 30
+    mc_samples = 10 # Monte Carlo 采样次数，用于DDVI模型的预测不确定性
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    batch_size = 2 # 训练批量大小
+    patience = 30  # 多少个epoch没有改进就提前停止
+    max_epochs = 301 # 最大训练epoch数
+    
+    print("[Log] ====== Starting to load training set ======")
+    train_set = OzoneSeqDataset(
+        data_path, 
+        seq_len=seq_len, 
+        train=True,
+        max_period=max_period,
+        num_scales=num_scales
+    )
+    
+    print("\n[Log] ====== Starting to load validation set ======")
+    val_set = OzoneSeqDataset(
+        data_path, 
+        seq_len=seq_len, 
+        train=False, 
+        feature_cols=train_set.feature_cols, # 确保验证集使用与训练集相同的特征
+        max_period=max_period,
+        num_scales=num_scales
+    )
+    
+    num_nodes = train_set.get_num_nodes()
+    num_feat = train_set.get_num_features()
+    node_order = train_set.get_node_order()
+    adj = build_adj_matrix(node_order, train_set.get_neighbors()).to(device)
+    train_loader = DataLoader(train_set, batch_size=batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(val_set, batch_size=batch_size, shuffle=False, num_workers=0)
+    
+    # 获取用于逆标准化的Scaler和Decomposer（用于可视化）
+    feature_scalers, target_scalers = train_set.get_scalers()
+    decomposer = train_set.get_decomposer()
+    feature_cols = train_set.get_feature_cols() # 获取最终使用的特征列名
+
+    print("\n[Log] Building model with gcn_layers=1...")
+    model = MultiScaleGCN_LSTM_Attn_Net(
+        num_nodes=num_nodes,
+        seq_len=seq_len,
+        num_feat=num_feat,
+        cnn_channels=32,
+        gcn_hidden=64,
+        gcn_layers=1, # 设定GCN层数为1
+        lstm_hidden=128,
+        num_layers=2,
+        num_scales=num_scales
+    ).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.0003, weight_decay=1e-4)
+    
+    best_val_rmse = np.inf
+    save_path = "best_ozone_multiscale_ddvi_model_gcn1.pth"
+    best_epoch = 0
+    
+    print("\n[Log] ====== Starting training ======")
+    for epoch in range(1, max_epochs+1):
+        train_loss, _, _, _ = run_epoch(
+            model, train_loader, device, adj, 
+            optimizer=optimizer
+        )
+        val_loss, val_pred, val_true, val_std = run_epoch(
+            model, val_loader, device, adj,
+            optimizer=None, # 评估模式，无优化器
+            feature_scalers=feature_scalers,
+            target_scalers=target_scalers,
+            node_order=node_order,
+            mc_samples=mc_samples
+        )
+        # 计算评估指标
+        val_rmse = mean_squared_error(val_true.flatten(), val_pred.flatten())**0.5
+        val_mae  = mean_absolute_error(val_true.flatten(), val_pred.flatten())
+        val_r2   = r2_score(val_true.flatten(), val_pred.flatten())
+        val_mse  = mean_squared_error(val_true.flatten(), val_pred.flatten())
+        val_mape = mape(val_true.flatten(), val_pred.flatten())
+        val_smape= smape(val_true.flatten(), val_pred.flatten())
+        val_medae= median_absolute_error(val_true.flatten(), val_pred.flatten())
+        avg_uncertainty = val_std.mean() if val_std is not None else np.nan
+        
+        # 保存最佳模型
+        if val_rmse < best_val_rmse:
+            best_val_rmse = val_rmse
+            best_epoch = epoch
+            torch.save(model.state_dict(), save_path)
+            print(f"[Log][Model saved] Improved at epoch {epoch}, "
+                  f"ValRMSE={val_rmse:.3f}, AvgUncertainty={avg_uncertainty:.3f}")
+        
+        # 提前停止
+        if epoch - best_epoch >= patience:
+            print(f'[Log] Early stopping at epoch {epoch}. Best val RMSE: {best_val_rmse:.3f}')
+            break
+        
+        # 每隔一定epoch打印日志
+        if epoch%10==0 or epoch==1:
+            print(f'[Log][Epoch {epoch:3d}] TrainLoss:{train_loss:.4f} | '
+                  f'ValMSE:{val_mse:.3f} | RMSE:{val_rmse:.3f} | MAE:{val_mae:.3f} | '
+                  f'R2:{val_r2:.3f} | MAPE:{val_mape:.2f}% | sMAPE:{val_smape:.2f}% | '
+                  f'MedAE:{val_medae:.3f} | AvgUncertainty:{avg_uncertainty:.3f}')
+    
+    # 训练结束后，加载最佳模型进行最终评估和SHAP分析
+    print("\n[Log] Loading best model (gcn_layers=1) and evaluating validation set")
+    model.load_state_dict(torch.load(save_path, map_location=device))
+    
+    # 再次运行评估，确保使用最佳模型权重
+    v_loss, v_pred, v_true, v_std = run_epoch(
+        model, val_loader, device, adj,
+        optimizer=None,
+        feature_scalers=feature_scalers,
+        target_scalers=target_scalers,
+        node_order=node_order,
+        mc_samples=mc_samples
+    )
+    
+    # 最终评估结果
+    v_rmse = mean_squared_error(v_true.flatten(), v_pred.flatten())** 0.5
+    v_mae  = mean_absolute_error(v_true.flatten(), v_pred.flatten())
+    v_r2   = r2_score(v_true.flatten(), v_pred.flatten())
+    v_mse  = mean_squared_error(v_true.flatten(), v_pred.flatten())
+    v_mape = mape(v_true.flatten(), v_pred.flatten())
+    v_smape = smape(v_true.flatten(), v_pred.flatten())
+    v_medae= median_absolute_error(v_true.flatten(), v_pred.flatten())
+    avg_uncertainty = v_std.mean() if v_std is not None else np.nan
+    
+    print(f"\n[Log][Final Validation Set Performance] "
+          f"MSE={v_mse:.3f}, RMSE={v_rmse:.3f}, MAE={v_mae:.3f}, MedAE={v_medae:.3f}\n"
+          f"MAPE={v_mape:.2f}%, sMAPE={v_smape:.2f}%, R2={v_r2:.3f}\n"
+          f"Average Prediction Uncertainty: {avg_uncertainty:.3f}")
+    
+    # =================== 可视化部分 ===================
+    if len(v_pred) > 0 and v_std is not None:
+        plt.style.use('seaborn-v0_8-whitegrid')
+        total_samples = len(v_pred.flatten())
+        sample_size = min(1500, total_samples) # 最多选择1500个点进行散点图可视化
+        idxs = np.random.choice(total_samples, sample_size, replace=False)
+        
+        plt.figure(figsize=(10, 8))
+        scatter = plt.scatter(
+            v_true.flatten()[idxs], 
+            v_pred.flatten()[idxs], 
+            c=v_std.flatten()[idxs],  # 颜色表示不确定性
+            cmap='viridis', 
+            s=30, 
+            alpha=0.6,
+            label='Predictions (color: uncertainty)'
+        )
+        cbar = plt.colorbar(scatter)
+        cbar.set_label('Prediction Uncertainty (Std)', fontsize=12)
+        _min, _max = v_true.flatten().min(), v_true.flatten().max()
+        plt.plot([_min, _max], [_min, _max], 'r--', label='Ideal Prediction Line')
+        plt.xlabel('Actual Ozone Concentration', fontsize=12)
+        plt.ylabel('Predicted Ozone Concentration', fontsize=12)
+        plt.title(f'Predicted vs Actual Values (R²={v_r2:.3f})', fontsize=14)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        
+        plt.figure(figsize=(12, 6))
+        site_idx = 0 # 选择第一个站点进行时序图展示
+        site_id = node_order[site_idx] if len(node_order) > 0 else "N/A"
+        time_points = range(min(50, len(v_true))) # 展示前50个时间点
+        plt.plot(time_points, v_true[time_points, site_idx], 'b-', label='Actual Values')
+        plt.plot(time_points, v_pred[time_points, site_idx], 'r-', label='Predicted Mean')
+        plt.fill_between(
+            time_points,
+            v_pred[time_points, site_idx] - 1.96 * v_std[time_points, site_idx], # 95% CI下限
+            v_pred[time_points, site_idx] + 1.96 * v_std[time_points, site_idx], # 95% CI上限
+            color='pink', 
+            alpha=0.3, 
+            label='95% Confidence Interval'
+        )
+        plt.xlabel('Time Points', fontsize=12)
+        plt.ylabel('Ozone Concentration', fontsize=12)
+        plt.title(f'Ozone Prediction with DDVI Uncertainty for Site {site_id}', fontsize=14)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+        
+        plt.figure(figsize=(10, 8))
+        errors = np.abs(v_true.flatten() - v_pred.flatten())
+        plt.scatter(v_std.flatten(), errors, alpha=0.5, s=20, label='Samples')
+        # 拟合一条线性趋势线
+        z = np.polyfit(v_std.flatten(), errors, 1)
+        p = np.poly1d(z)
+        plt.plot(v_std.flatten(), p(v_std.flatten()), "r--", label=f'Trend: y={z[0]:.2f}x+{z[1]:.2f}')
+        plt.xlabel('Prediction Uncertainty (Std)', fontsize=12)
+        plt.ylabel('Prediction Error (Absolute)', fontsize=12)
+        plt.title('DDVI Uncertainty vs Prediction Error', fontsize=14)
+        plt.legend()
+        plt.tight_layout()
+        plt.show()
+    
+    print("[Log] Plotting multi-scale decomposition example...")
+    if len(train_set.get_node_order()) > 0:
+        first_node = train_set.get_node_order()[0]
+        sample_data = pd.read_excel(data_path)
+        sample_data[train_set.time_col] = pd.to_datetime(sample_data[train_set.time_col])
+        node_data = sample_data[sample_data[train_set.node_col] == first_node].sort_values(train_set.time_col)
+        if not node_data.empty:
+            node_series = node_data.set_index(train_set.time_col)[train_set.target_col]
+            components = decomposer.decompose(first_node, node_series)
+            periods = decomposer.periods[first_node]
+            
+            plt.figure(figsize=(14, 10))
+            # 动态调整子图数量，以便显示所有周期性分量
+            num_plot_rows = len(components.columns) - 1 + len(periods) # 原始+趋势+每个周期+残差+融合
+            
+            ax1 = plt.subplot(num_plot_rows, 1, 1)
+            ax1.plot(node_series, label='Original')
+            ax1.set_title('Original Ozone Sequence')
+            
+            ax2 = plt.subplot(num_plot_rows, 1, 2)
+            ax2.plot(components['trend'], label='Trend')
+            ax2.set_title('Trend Component (Long-term Variation)')
+            
+            plot_idx = 3
+            for i, p in enumerate(periods):
+                ax = plt.subplot(num_plot_rows, 1, plot_idx)
+                ax.plot(components[f'periodic_{p}d'], label=f'Periodic {p}d')
+                ax.set_title(f'Periodic Component (Period={p} Days)')
+                plot_idx += 1
+            
+            ax_res = plt.subplot(num_plot_rows, 1, plot_idx)
+            ax_res.plot(components['residual'], label='Residual', color='gray')
+            ax_res.set_title('Residual Component')
+            
+            plt.tight_layout()
+            plt.show()
+    
+    print("[Log] Comparing optimal periods across different sites...")
+    if len(node_order) > 0:
+        nodes_to_plot = node_order[:min(5, len(node_order))] # 最多显示前5个站点
+        periods_list = [decomposer.periods[node] for node in nodes_to_plot if node in decomposer.periods]
+        
+        if periods_list:
+            plt.figure(figsize=(10, 6))
+            x = np.arange(len(nodes_to_plot))
+            width = 0.2
+            
+            for i in range(num_scales):
+                plt.bar(x + i*width, [p[i] for p in periods_list], width, label=f'Scale {i+1} Period')
+            
+            plt.xlabel('Site ID', fontsize=12)
+            plt.ylabel('Period Length (Days)', fontsize=12)
+            plt.title('Multi-scale Optimal Periods for Different Sites', fontsize=14)
+            plt.xticks(x + width*(num_scales-1)/2, nodes_to_plot) # x轴标签居中
+            plt.legend()
+            plt.tight_layout()
+            plt.show()
+
+    # =================== 执行 SHAP 分析 ===================
+    # 在模型训练和评估完成后调用 SHAP 分析函数
+    shap_analysis(val_set, model, adj, node_order, feature_cols, seq_len, num_feat, device)
+
+
+if __name__ == "__main__":
+    main()
